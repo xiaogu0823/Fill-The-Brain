@@ -1,0 +1,1472 @@
+import os
+
+import pandas as pd
+
+from virtual.description_template import EmotionSpeechSynthesizer
+from virtual.emo_linechat import EmotionLineChat
+from virtual.radarmap import SimplifiedEmotionAnalysis
+from virtual.comprehensive_score_table import ComprehensiveScoreTable
+from utils.dialog_utils import show_styled_message_box
+from utils.i18n import get_language_manager
+from utils.logger import get_logger
+from utils.test_record_logger import TestRecordLogger
+from utils.ui_scaling import apply_window_scaling
+from utils.signal_manager import SignalManager
+from ui.product_selection_dialog import ProductSelectionDialog
+from ui.records_dialog import TestRecordsViewerDialog
+import config.settings as config
+from PyQt5.QtCore import pyqtSignal, QTimer, Qt, QSize, QUrl
+from PyQt5.QtGui import QPixmap, QIcon, QDesktopServices, QPainter
+from PyQt5 import uic
+from PyQt5.QtWidgets import (
+    QGraphicsScene, QGraphicsPixmapItem, QDialog, QVBoxLayout, QHBoxLayout,
+    QGroupBox, QLabel, QLineEdit, QComboBox, QPushButton, QMessageBox,
+    QWidget, QToolButton, QSizePolicy
+)
+from PIL import Image, ImageDraw, ImageFont
+
+
+class ProjectsTestWindow(QWidget):
+    test_complete = pyqtSignal()
+    return_to_calibration = pyqtSignal()
+    minimize_requested = pyqtSignal()
+    close_requested = pyqtSignal()
+
+    def __init__(self, person_id, product_name, analysis_manager, camera_manager):
+        super().__init__()
+        self.logger = get_logger(__name__)
+
+        self.showMinimized()
+
+        ui_path = config.UI_FILES_DIR / "test_window.ui"
+        uic.loadUi(str(ui_path), self)
+        apply_window_scaling(self)
+
+        self.setGeometry(0, 0, 0, 0)
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+
+        self.language_manager = get_language_manager()
+        self.person_id = person_id
+        self.current_product_name = product_name
+        self.product_tests = []
+        self.record_logger = TestRecordLogger()
+        self.runtime_signals = SignalManager()
+        self._runtime_signals_connected = False
+        self.workflow_stage = "calibration_pending"
+        self.is_calibrating = False
+        self.calibration_completed = False
+        self.current_title_key = None
+        self.current_title_kwargs = {}
+        self.current_camera_title_key = None
+        self.current_camera_title_kwargs = {}
+        self.current_camera_view_key = None
+        self.current_camera_view_kwargs = {}
+        self.current_status_key = None
+        self.current_status_kwargs = {}
+        self.current_timer_seconds = 0
+        
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFocus()
+
+        self.stackedWidget.setCurrentIndex(0)
+        
+        self.begin_pushButton.clicked.connect(self.start_recording)
+        self.test_result_pushButton_2.clicked.connect(self.analyze_results)
+        self.next_pushButton_3.clicked.connect(self.next_product)
+        self.all_result_pushButton.clicked.connect(self.show_comprehensive_analysis)
+        self.compelte_pushButton_4.clicked.connect(self.end_test)
+        
+        self.camera_manager = camera_manager
+        self.camera_manager.set_person_id(person_id)
+        
+        self.is_recording = False
+        self.recording_completed = False
+        self.comprehensive_analysis_shown = False
+        self.current_video_path = ""
+        
+        self.analysis_manager = analysis_manager
+        self.analysis_worker = self.analysis_manager.get_worker()
+        self.camera_manager.analysis_worker = self.analysis_worker
+        self._connect_runtime_signals()
+
+        self.calibration_data = None
+        self.calibration_csv_path = ""
+        self.graphicsView_image.setScene(None)
+
+        self.setup_comprehensive_analysis_page()
+        self.setup_calibration_button()
+        self.setup_window_controls()
+        self.sync_primary_button_geometry()
+        
+        self.selected_product_from_table = None
+        self.is_viewing_product_from_table = False
+
+        # Quick access buttons near the preview panel.
+        self.setup_recordings_button()
+        self.setup_test_records_button()
+        self.language_manager.language_changed.connect(self.apply_translations)
+        QTimer.singleShot(200, self.position_top_right_buttons)
+            
+        self.init_camera()
+        self.enter_calibration_stage()
+        self.set_camera_view_message("camera_preview_not_running")
+        self.apply_translations()
+
+    def get_product_display_name(self, product_name):
+        return product_name.replace('_', ' ') if '_' in product_name else product_name
+
+    def tr(self, key, **kwargs):
+        return self.language_manager.tr(key, **kwargs)
+
+    def setup_window_controls(self):
+        page = self.stackedWidget.widget(0)
+        self.minimize_button = QToolButton(page)
+        self.minimize_button.setObjectName("minimize_button")
+        self.minimize_button.setFixedSize(54, 36)
+        self.minimize_button.setCursor(Qt.PointingHandCursor)
+        self.minimize_button.setText("-")
+        self.minimize_button.setStyleSheet(
+            """
+                QToolButton#minimize_button {
+                    background-color: #e2e8f0;
+                    color: #334155;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 8px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                QToolButton#minimize_button:hover {
+                    background-color: #cbd5e1;
+                }
+            """
+        )
+        self.minimize_button.clicked.connect(self.minimize_requested.emit)
+        self.minimize_button.show()
+        self.minimize_button.raise_()
+
+        self.close_button = QToolButton(page)
+        self.close_button.setObjectName("close_button")
+        self.close_button.setFixedSize(54, 36)
+        self.close_button.setCursor(Qt.PointingHandCursor)
+        self.close_button.setText("x")
+        self.close_button.setStyleSheet(
+            """
+                QToolButton#close_button {
+                    background-color: #ef4444;
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                QToolButton#close_button:hover {
+                    background-color: #dc2626;
+                }
+            """
+        )
+        self.close_button.clicked.connect(self.close_requested.emit)
+        self.close_button.show()
+        self.close_button.raise_()
+
+    def set_window_title_text(self, key, **kwargs):
+        self.current_title_key = key
+        self.current_title_kwargs = kwargs
+        self.setWindowTitle(self.tr(key, **kwargs))
+
+    def set_camera_title(self, key, **kwargs):
+        self.current_camera_title_key = key
+        self.current_camera_title_kwargs = kwargs
+        self.label_camera_title.setText(self.tr(key, **kwargs))
+
+    def set_camera_view_message(self, key, **kwargs):
+        self.current_camera_view_key = key
+        self.current_camera_view_kwargs = kwargs
+        self.label_camera_view.setText(self.tr(key, **kwargs))
+
+    def set_status_message(self, key, **kwargs):
+        self.current_status_key = key
+        self.current_status_kwargs = kwargs
+        self.label_status.setText(self.tr(key, **kwargs))
+
+    def set_remaining_time(self, seconds):
+        self.current_timer_seconds = seconds
+        self.label_timer.setText(self.tr("remaining_time", seconds=seconds))
+
+    def apply_translations(self):
+        self.begin_pushButton.setText(
+            self.tr(
+                "start_recording_button",
+                product=self.get_product_display_name(self.current_product_name),
+            )
+            if self.begin_pushButton.isEnabled() and not self.is_recording and not self.recording_completed
+            else self.begin_pushButton.text()
+        )
+        self.next_pushButton_3.setText(self.tr("next_product_button"))
+        self.test_result_pushButton_2.setText(self.tr("current_product_analysis_button"))
+        self.all_result_pushButton.setText(self.tr("overall_results_button"))
+        self.compelte_pushButton_4.setText(self.tr("finish_test_button"))
+        self.all_result_label.setText(self.tr("product_summary_table"))
+        self.recordings_button.setText(self.tr("recordings_button"))
+        self.recordings_button.setToolTip(self.tr("recordings_button_tooltip"))
+        self.test_records_button.setText(self.tr("test_records_button"))
+        self.test_records_button.setToolTip(self.tr("test_records_button_tooltip"))
+        if self.current_title_key:
+            self.setWindowTitle(self.tr(self.current_title_key, **self.current_title_kwargs))
+        else:
+            self.set_window_title_text(
+                "test_window_title",
+                person_id=self.person_id,
+                product=self.get_product_display_name(self.current_product_name),
+            )
+
+        if self.current_camera_title_key:
+            self.label_camera_title.setText(
+                self.tr(self.current_camera_title_key, **self.current_camera_title_kwargs)
+            )
+        if self.current_camera_view_key:
+            self.label_camera_view.setText(
+                self.tr(self.current_camera_view_key, **self.current_camera_view_kwargs)
+            )
+        if self.current_status_key:
+            self.label_status.setText(self.tr(self.current_status_key, **self.current_status_kwargs))
+        self.set_remaining_time(self.current_timer_seconds)
+        self._sync_calibration_button_state()
+        self.position_top_right_buttons()
+
+    def setup_calibration_button(self):
+        self.calibrate_pushButton = QPushButton(self)
+        self.calibrate_pushButton.clicked.connect(self.start_calibration)
+        self.verticalLayout_buttons.insertWidget(1, self.calibrate_pushButton)
+        self.calibrate_pushButton.setStyleSheet(self.get_default_button_style())
+
+    def sync_primary_button_geometry(self):
+        reference_button = getattr(self, "begin_pushButton", None)
+        if not reference_button:
+            return
+
+        reference_policy = reference_button.sizePolicy()
+        reference_min_height = max(reference_button.minimumHeight(), 120)
+        reference_min_width = max(reference_button.minimumWidth(), 320)
+
+        for button in (
+            getattr(self, "calibrate_pushButton", None),
+            getattr(self, "compelte_pushButton_4", None),
+        ):
+            if not button:
+                continue
+            button.setSizePolicy(
+                QSizePolicy(reference_policy.horizontalPolicy(), reference_policy.verticalPolicy())
+            )
+            button.setMinimumHeight(reference_min_height)
+            button.setMinimumWidth(reference_min_width)
+
+    def _should_enable_calibration_button(self):
+        return (
+            self.workflow_stage == "calibration_ready"
+            and not self.is_calibrating
+            and not self.calibration_completed
+        )
+
+    def _sync_calibration_button_state(self):
+        if self._should_enable_calibration_button():
+            self.calibrate_pushButton.setText(self.tr("start_calibration_button"))
+            self.calibrate_pushButton.setEnabled(True)
+            self.calibrate_pushButton.setStyleSheet(self.get_default_button_style())
+            return
+
+        if self.is_calibrating:
+            self.calibrate_pushButton.setText(self.tr("calibrating_button"))
+            self.calibrate_pushButton.setEnabled(False)
+            self.calibrate_pushButton.setStyleSheet(self.get_recording_button_style())
+            return
+
+        if self.calibration_completed:
+            self.calibrate_pushButton.setText(self.tr("calibration_complete_button"))
+            self.calibrate_pushButton.setEnabled(False)
+            self.calibrate_pushButton.setStyleSheet(self.get_disabled_button_style())
+            return
+
+        self.calibrate_pushButton.setEnabled(False)
+        self.calibrate_pushButton.setStyleSheet(self.get_disabled_button_style())
+
+    def _connect_runtime_signals(self):
+        if self._runtime_signals_connected:
+            return
+
+        self.runtime_signals.connect(self.camera_manager.frame_updated, self.update_camera_display)
+        self.runtime_signals.connect(self.camera_manager.recording_progress, self.update_recording_progress)
+        self.runtime_signals.connect(self.camera_manager.recording_finished, self.on_recording_finished)
+        self.runtime_signals.connect(self.analysis_worker.analysis_started, self.on_analysis_started)
+        self.runtime_signals.connect(self.analysis_worker.analysis_progress, self.on_analysis_progress)
+        self.runtime_signals.connect(self.analysis_worker.analysis_finished, self.on_analysis_finished)
+        self.runtime_signals.connect(self.analysis_worker.analysis_finished_calib, self.on_calibration_analysis_finished)
+        self.runtime_signals.connect(self.analysis_worker.analysis_failed, self.on_analysis_failed)
+        self._runtime_signals_connected = True
+
+    def _disconnect_runtime_signals(self):
+        if not self._runtime_signals_connected:
+            return
+        self.runtime_signals.disconnect_all()
+        self._runtime_signals_connected = False
+
+    def enter_calibration_stage(self):
+        self.workflow_stage = "calibration_ready"
+        self.is_calibrating = False
+        self.recording_completed = False
+        self.current_video_path = ""
+        self.progressBar_recording.setValue(0)
+        self.set_window_title_text(
+            "test_window_title",
+            person_id=self.person_id,
+            product=self.get_product_display_name(self.current_product_name),
+        )
+        self.set_camera_title("calibration_preview_title")
+        self.set_camera_view_message("calibration_preview_hint")
+        self.set_remaining_time(3)
+        self.begin_pushButton.setText(
+            self.tr(
+                "start_recording_button",
+                product=self.get_product_display_name(self.current_product_name),
+            )
+        )
+        self.begin_pushButton.setEnabled(False)
+        self.begin_pushButton.setStyleSheet(self.get_default_button_style())
+        self.set_status_message("status_complete_calibration_first")
+        self.next_pushButton_3.setEnabled(False)
+        self.test_result_pushButton_2.setEnabled(False)
+        self.all_result_pushButton.setEnabled(False)
+        self.compelte_pushButton_4.setEnabled(True)
+        self._sync_calibration_button_state()
+        self.update_button_styles()
+
+    def enter_test_stage(self):
+        self.workflow_stage = "test_ready"
+        self.is_calibrating = False
+        self.recording_completed = False
+        self.current_video_path = ""
+        self.stackedWidget.setCurrentIndex(0)
+        self.progressBar_recording.setValue(0)
+        self.set_window_title_text(
+            "test_window_title",
+            person_id=self.person_id,
+            product=self.get_product_display_name(self.current_product_name),
+        )
+        self.set_camera_title(
+            "test_preview_title",
+            product=self.get_product_display_name(self.current_product_name),
+        )
+        self.set_remaining_time(8)
+        self.begin_pushButton.setText(
+            self.tr(
+                "start_recording_button",
+                product=self.get_product_display_name(self.current_product_name),
+            )
+        )
+        self.begin_pushButton.setEnabled(True)
+        self.begin_pushButton.setStyleSheet(self.get_default_button_style())
+        self.set_status_message(
+            "status_calibration_complete_start_testing",
+            product=self.get_product_display_name(self.current_product_name),
+        )
+        self._sync_calibration_button_state()
+        self.update_button_states(initial=True)
+
+    def setup_recordings_button(self):
+        try:
+            page = self.stackedWidget.widget(0)
+            self.recordings_button = QToolButton(page)
+            self.recordings_button.setObjectName("recordings_button")
+            self.recordings_button.setFixedSize(54, 36)
+            self.recordings_button.setCursor(Qt.PointingHandCursor)
+            self.recordings_button.setStyleSheet(
+                """
+                QToolButton#recordings_button {
+                    background-color: #4f46e5;
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                QToolButton#recordings_button:hover {
+                    background-color: #4338ca;
+                }
+            """
+            )
+            self.recordings_button.clicked.connect(self.open_recordings_directory)
+            self.recordings_button.show()
+            self.recordings_button.raise_()
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize the recordings button: {e}")
+
+    def setup_test_records_button(self):
+        """Place the records button at the top-right corner of the test page."""
+        try:
+            #  获取测试页（page）
+            page = self.stackedWidget.widget(0)
+
+            self.test_records_button = QToolButton(page)
+            self.test_records_button.setObjectName("test_records_button")
+            self.test_records_button.setFixedSize(54, 36)
+            self.test_records_button.setCursor(Qt.PointingHandCursor)
+
+            icon_path = os.path.join("ui", "icons", "csv.png")
+            if os.path.exists(icon_path):
+                self.test_records_button.setIcon(QIcon(icon_path))
+                self.test_records_button.setIconSize(QSize(18, 18))
+
+            self.test_records_button.setStyleSheet("""
+                QToolButton#test_records_button {
+                    background-color: #667eea;
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                QToolButton#test_records_button:hover {
+                    background-color: #764ba2;
+                }
+            """)
+
+            self.test_records_button.clicked.connect(self.show_test_records_csv)
+            self.test_records_button.show()
+            self.test_records_button.raise_()
+
+            self.position_top_right_buttons()
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize the records button: {e}")
+
+    def position_top_right_buttons(self):
+        try:
+            if not hasattr(self, 'test_records_button'):
+                return
+            margin_left = 12
+            margin_top = 12
+            gap = 10
+
+            file_x = margin_left
+            log_x = file_x + self.recordings_button.width() + gap
+            minimize_x = log_x + self.test_records_button.width() + gap
+            close_x = minimize_x + self.minimize_button.width() + gap
+            y = margin_top
+
+            self.recordings_button.move(file_x, y)
+            self.recordings_button.raise_()
+            self.recordings_button.show()
+
+            self.test_records_button.move(log_x, y)
+            self.test_records_button.raise_()
+            self.test_records_button.show()
+
+            self.minimize_button.move(minimize_x, y)
+            self.minimize_button.raise_()
+            self.minimize_button.show()
+            self.close_button.move(close_x, y)
+            self.close_button.raise_()
+            self.close_button.show()
+
+        except Exception as e:
+            self.logger.error(f"Failed to position the records button: {e}")
+
+    def _show_message_box(self, icon, title, text, buttons=QMessageBox.Ok, default_button=QMessageBox.NoButton):
+        return show_styled_message_box(self, icon, title, text, buttons, default_button)
+
+    def open_recordings_directory(self):
+        try:
+            recordings_dir = config.SCRIPT_DIR / "recordings"
+            recordings_dir.mkdir(parents=True, exist_ok=True)
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(recordings_dir))):
+                self._show_message_box(
+                    QMessageBox.Warning,
+                    self.tr("open_folder_failed_title"),
+                    self.tr("open_folder_failed_message", path=recordings_dir),
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to open recordings directory: {e}")
+            self._show_message_box(
+                QMessageBox.Warning,
+                self.tr("open_folder_failed_title"),
+                self.tr("open_recordings_directory_failed", error=e),
+            )
+
+    def get_test_records_csv_path(self):
+
+        try:
+            if hasattr(self.record_logger, 'csv_path'):
+                csv_path = getattr(self.record_logger, 'csv_path')
+                if csv_path:
+                    return os.path.abspath(csv_path)
+
+            if hasattr(self.record_logger, 'file_path'):
+                csv_path = getattr(self.record_logger, 'file_path')
+                if csv_path:
+                    return os.path.abspath(csv_path)
+
+            if hasattr(self.record_logger, 'record_file'):
+                csv_path = getattr(self.record_logger, 'record_file')
+                if csv_path:
+                    return os.path.abspath(csv_path)
+
+        except Exception as e:
+            self.logger.error(f"Failed to get the test_records.csv path: {e}")
+
+        return os.path.abspath("test_records.csv")
+
+    def show_test_records_csv(self):
+        """Open the record center with filtering and export support."""
+        try:
+            self.record_logger.ensure_file()
+            if not os.path.exists(self.record_logger.file_path):
+                self._show_message_box(
+                    QMessageBox.Warning,
+                    self.tr("file_not_found_title"),
+                    self.tr("test_record_file_missing", file_path=self.record_logger.file_path),
+                )
+                return
+
+            dialog = TestRecordsViewerDialog(self.record_logger, self)
+            dialog.exec_()
+
+        except Exception as e:
+            self.logger.error(f"Failed to open test_records.csv: {e}")
+            self._show_message_box(
+                QMessageBox.Critical,
+                self.tr("error_title"),
+                self.tr("open_test_records_failed", error=str(e)),
+            )
+    
+    def init_camera(self):
+        success, message = self.camera_manager.init_camera()
+        if success:
+            self.camera_manager.start_preview()
+            self.set_status_message("status_camera_initialized")
+        else:
+            self.set_status_message("status_camera_init_failed")
+            self.set_camera_view_message("camera_connection_check")
+    
+    def update_camera_display(self, frame):
+        pixmap = self.camera_manager.get_frame_qpixmap(frame, self.label_camera_view.size())
+        self.label_camera_view.setPixmap(pixmap)
+        self.label_camera_view.setScaledContents(True)
+
+    def update_recording_progress(self, progress, elapsed_time):
+        if self.is_calibrating:
+            self.progressBar_recording.setValue(progress)
+            remaining = max(0, 3 - int(elapsed_time))
+            self.set_remaining_time(remaining)
+        elif self.is_recording:
+            self.progressBar_recording.setValue(progress)
+            remaining = max(0, 8 - int(elapsed_time))
+            self.set_remaining_time(remaining)
+    
+    def on_recording_finished(self, filename, total_frames):
+        if self.workflow_stage == "calibration_recording":
+            self.is_calibrating = False
+            self.workflow_stage = "calibration_analysis"
+            self.current_video_path = filename
+            self.progressBar_recording.setValue(100)
+            self.set_remaining_time(0)
+            self.calibrate_pushButton.setEnabled(False)
+            self.calibrate_pushButton.setText(self.tr("analyzing_calibration_button"))
+            self.set_status_message("status_calibration_recording_finished")
+            self.analysis_worker.analyze_calibration_video(self.current_video_path)
+            return
+
+        self.is_recording = False
+        self.recording_completed = True
+        self.current_video_path = filename
+        
+        self.begin_pushButton.setText(self.tr("recording_complete_button"))
+        self.set_status_message(
+            "status_recording_complete_start_analysis",
+            product=self.get_product_display_name(self.current_product_name),
+        )
+        self.progressBar_recording.setValue(100)
+        self.set_remaining_time(0)
+        
+        self.update_button_states(analysis_started=True)
+        QTimer.singleShot(500, lambda: self.start_video_analysis())
+    
+    def start_video_analysis(self):
+        if self.current_video_path and os.path.exists(self.current_video_path):
+            self.analysis_worker.analyze_video(self.current_video_path, self.current_product_name)
+            self.set_status_message("status_analyzing_recorded_video")
+        else:
+            self.set_status_message("status_video_file_missing")
+            self.update_button_states(analysis_finished=True)
+    
+    def on_analysis_started(self, video_path, product_name):
+        if self.workflow_stage.startswith("calibration"):
+            self.set_status_message("status_analyzing_calibration_video")
+        else:
+            self.set_status_message(
+                "status_analyzing_video_for_product",
+                product=self.get_product_display_name(product_name),
+            )
+    
+    def on_analysis_progress(self, current_frame, total_frames):
+        progress = int((current_frame / total_frames) * 100) if total_frames > 0 else 0
+        if self.workflow_stage.startswith("calibration"):
+            self.set_status_message(
+                "status_calibration_analysis_progress",
+                progress=progress,
+                current_frame=current_frame,
+                total_frames=total_frames,
+            )
+        else:
+            self.set_status_message(
+                "status_analysis_progress",
+                progress=progress,
+                current_frame=current_frame,
+                total_frames=total_frames,
+            )
+        
+    def on_analysis_finished(self, video_path, csv_path, product_name=None):
+        try:
+            if product_name is None:
+                product_name = self.current_product_name
+                
+            self.set_status_message("status_video_analysis_complete", csv_path=csv_path)
+            if not os.path.exists(self.calibration_csv_path):
+                raise FileNotFoundError("Calibration data was not found. Unable to generate the test result.")
+
+            chart_result = self.generate_comprehensive_chart(product_name, csv_path)
+            if not chart_result:
+                raise RuntimeError("Failed to generate the summary chart.")
+
+            score_data, top_emotions, comprehensive_path = chart_result
+            test_result = {
+                'product_name': product_name,
+                'display_name': self.get_product_display_name(product_name),
+                'video_path': video_path,
+                'csv_path': csv_path,
+                'score_data': float(score_data),
+                'emotion_details': top_emotions,
+                'comprehensive_path': comprehensive_path,
+            }
+            
+            existing_index = None
+            for i, test in enumerate(self.product_tests):
+                if test.get('product_name') == product_name:
+                    existing_index = i
+                    break
+            
+            if existing_index is not None:
+                self.product_tests[existing_index] = test_result
+            else:
+                self.product_tests.append(test_result)
+
+            self.record_logger.append_record(
+                person_id=self.person_id,
+                product_name=test_result['display_name'],
+                emotion_reaction=top_emotions,
+                comprehensive_score=float(score_data),
+            )
+            
+            self.refresh_display_after_analysis(product_name)
+            message = self.tr(
+                "analysis_complete_message",
+                product=self.get_product_display_name(product_name),
+            )
+            
+            self._show_message_box(QMessageBox.Information, self.tr("analysis_complete_title"), message)
+            self.set_status_message(
+                "status_analysis_complete_for_product",
+                product=self.get_product_display_name(product_name),
+            )
+            
+        except Exception as e:
+            error_msg = self.tr(
+                "analysis_complete_with_score_error",
+                product=self.get_product_display_name(product_name),
+                error=str(e),
+            )
+            self._show_message_box(QMessageBox.Warning, self.tr("analysis_complete_title"), error_msg)
+            self.set_status_message("status_analysis_complete_with_score_error", error=str(e))
+        finally:
+            self.update_button_states(analysis_finished=True) 
+
+    def on_calibration_analysis_finished(self, video_path, csv_path):
+        try:
+            self.set_calibration_data(csv_path)
+            self.calibration_completed = True
+            self._show_message_box(
+                QMessageBox.Information,
+                self.tr("calibration_complete_title"),
+                self.tr("calibration_complete_message"),
+            )
+            self.enter_test_stage()
+        except Exception as e:
+            self.workflow_stage = "calibration_ready"
+            self.calibration_completed = False
+            self._sync_calibration_button_state()
+            self._show_message_box(
+                QMessageBox.Warning,
+                self.tr("calibration_failed_title"),
+                self.tr("calibration_result_load_failed", error=e),
+            )
+    
+    def on_analysis_failed(self, video_path, error_msg, product_name):
+        if self.workflow_stage.startswith("calibration"):
+            self.workflow_stage = "calibration_ready"
+            self.is_calibrating = False
+            self.calibration_completed = False
+            self._sync_calibration_button_state()
+            self.set_status_message("status_calibration_analysis_failed", error=error_msg)
+            self._show_message_box(
+                QMessageBox.Warning,
+                self.tr("calibration_failed_title"),
+                self.tr("calibration_analysis_failed", error=error_msg),
+            )
+            return
+
+        self.set_status_message("status_analysis_failed", error=error_msg)
+        self.update_button_states(analysis_finished=True)
+        self._show_message_box(
+            QMessageBox.Warning,
+            self.tr("analysis_failed_title"),
+            self.tr(
+                "analysis_failed_for_product",
+                product=self.get_product_display_name(product_name),
+                error=error_msg,
+            ),
+        )
+    
+    def update_button_states(self, initial=False, analysis_started=False, analysis_finished=False):
+        if initial:
+            self.next_pushButton_3.setEnabled(False)
+            self.test_result_pushButton_2.setEnabled(False)
+            self.compelte_pushButton_4.setEnabled(False)
+            self.all_result_pushButton.setEnabled(False)
+            self.begin_pushButton.setEnabled(self.calibration_completed)
+            self._sync_calibration_button_state()
+        elif analysis_started:
+            self.begin_pushButton.setEnabled(False)
+            self.next_pushButton_3.setEnabled(False)
+            self.test_result_pushButton_2.setEnabled(False)
+            self.compelte_pushButton_4.setEnabled(False)
+            self.all_result_pushButton.setEnabled(False)
+            self._sync_calibration_button_state()
+        elif analysis_finished:
+            self.next_pushButton_3.setEnabled(True)
+            self.test_result_pushButton_2.setEnabled(True)
+            self.compelte_pushButton_4.setEnabled(True)
+            self.all_result_pushButton.setEnabled(True)
+            self.begin_pushButton.setEnabled(False)
+            self._sync_calibration_button_state()
+        
+        self.update_button_styles()
+    
+    def update_button_styles(self):
+        self.next_pushButton_3.setStyleSheet(
+            self.get_default_button_style() if self.next_pushButton_3.isEnabled() 
+            else self.get_disabled_button_style()
+        )
+        self.test_result_pushButton_2.setStyleSheet(
+            self.get_default_button_style() if self.test_result_pushButton_2.isEnabled() 
+            else self.get_disabled_button_style()
+        )
+        self.compelte_pushButton_4.setStyleSheet(
+            self.get_default_button_style() if self.compelte_pushButton_4.isEnabled() 
+            else self.get_disabled_button_style()
+        )
+        self.begin_pushButton.setStyleSheet(
+            self.get_default_button_style() if self.begin_pushButton.isEnabled() 
+            else self.get_disabled_button_style()
+        )
+        self.calibrate_pushButton.setStyleSheet(
+            self.get_default_button_style() if self.calibrate_pushButton.isEnabled()
+            else self.get_disabled_button_style()
+        )
+        self.all_result_pushButton.setStyleSheet(
+            self.get_default_button_style() if self.all_result_pushButton.isEnabled() 
+            else self.get_disabled_button_style()
+        )
+    
+    def start_recording(self):
+        if not self.calibration_completed:
+            self._show_message_box(
+                QMessageBox.Information,
+                self.tr("notice_title"),
+                self.tr("complete_calibration_first_notice"),
+            )
+            return
+
+        if self.recording_completed:
+            self._show_message_box(
+                QMessageBox.Information,
+                self.tr("notice_title"),
+                self.tr("recording_already_completed_notice"),
+            )
+            return
+            
+        if not self.camera_manager.cap or not self.camera_manager.cap.isOpened():
+            self._show_message_box(
+                QMessageBox.Warning,
+                self.tr("camera_error_title"),
+                self.tr("camera_not_ready_for_recording"),
+            )
+            return
+            
+        if not self.is_recording:
+            success, message = self.camera_manager.start_test_recording(
+                product_name=self.current_product_name, 
+                duration=8
+            )
+            if not success:
+                self._show_message_box(QMessageBox.Warning, self.tr("error_title"), message)
+                return
+            
+            self.is_recording = True
+            self.begin_pushButton.setEnabled(False)
+            self.begin_pushButton.setText(self.tr("recording_button"))
+            self.begin_pushButton.setStyleSheet(self.get_recording_button_style())
+            self.set_status_message(
+                "status_recording_in_progress",
+                seconds=8,
+                product=self.get_product_display_name(self.current_product_name),
+            )
+
+    def start_calibration(self):
+        if not self.camera_manager.cap or not self.camera_manager.cap.isOpened():
+            self._show_message_box(
+                QMessageBox.Warning,
+                self.tr("camera_error_title"),
+                self.tr("camera_not_ready_for_calibration"),
+            )
+            return
+
+        if self.is_calibrating:
+            return
+
+        success, message = self.camera_manager.start_calibration_recording(duration=3)
+        if not success:
+            self._show_message_box(QMessageBox.Warning, self.tr("error_title"), message)
+            return
+
+        self.workflow_stage = "calibration_recording"
+        self.is_calibrating = True
+        self.progressBar_recording.setValue(0)
+        self._sync_calibration_button_state()
+        self.begin_pushButton.setEnabled(False)
+        self.set_camera_title("calibration_preview_capturing")
+        self.set_status_message("status_calibration_in_progress")
+
+    def analyze_results(self):
+        if not self.recording_completed:
+            self._show_message_box(
+                QMessageBox.Warning,
+                self.tr("analysis_failed_title"),
+                self.tr("complete_test_before_analysis"),
+            )
+            return
+        
+        self.is_viewing_product_from_table = False
+        self.selected_product_from_table = None
+        self.stackedWidget.setCurrentIndex(1)
+        self.show_product_visualization(self.current_product_name, is_current_product=True)
+   
+    def next_product(self):
+        if not self.recording_completed:
+            self._show_message_box(
+                QMessageBox.Warning,
+                self.tr("action_failed_title"),
+                self.tr("finish_current_recording_first"),
+            )
+            return
+        
+        try:
+            available_products = self.load_available_products()
+            dialog = ProductSelectionDialog(available_products, self)
+            
+            if dialog.exec_() == QDialog.Accepted:
+                new_product_name = dialog.get_selected_product()
+                reply = self._show_message_box(
+                    QMessageBox.Question,
+                    self.tr("confirm_product_switch_title"),
+                    self.tr(
+                        "confirm_product_switch_message",
+                        new_product=new_product_name,
+                        current_product=self.get_product_display_name(self.current_product_name),
+                    ),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                
+                if reply == QMessageBox.Yes:
+                    self.switch_to_new_product(new_product_name)
+        
+        except Exception as e:
+            self._show_message_box(
+                QMessageBox.Critical,
+                self.tr("error_title"),
+                self.tr("product_selection_error", error=str(e)),
+            )
+
+    def load_available_products(self):
+        try:
+            file_path = "ui/options.txt"
+            if os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8') as file:
+                    products = [line.strip() for line in file if line.strip()]
+                return products
+            return []
+        except Exception:
+            return []
+
+    def switch_to_new_product(self, new_product_name):
+        # 检查是否已有相同产品的测试记录
+        for test in self.product_tests:
+            if test.get('product_name') == new_product_name and test.get('score_data') is not None:
+                reply = self._show_message_box(
+                    QMessageBox.Question,
+                    self.tr("overwrite_existing_result_title"),
+                    self.tr("overwrite_existing_result_message"),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply == QMessageBox.No:
+                    return
+
+        self.comprehensive_analysis_shown = False
+        
+        product_exists = any(
+            test.get('product_name') == self.current_product_name 
+            and test.get('score_data') is not None
+            for test in self.product_tests
+        )
+        
+        if not product_exists and self.recording_completed:
+            self.product_tests.append({
+                'product_name': self.current_product_name,
+                'display_name': self.get_product_display_name(self.current_product_name),
+                'video_path': self.current_video_path
+            })
+        
+        self.current_product_name = new_product_name
+        self.reset_test()
+        self.set_window_title_text(
+            "test_window_title",
+            person_id=self.person_id,
+            product=self.get_product_display_name(self.current_product_name),
+        )
+        self.set_status_message(
+            "status_ready_product",
+            product=self.get_product_display_name(self.current_product_name),
+        )
+        self._show_message_box(
+            QMessageBox.Information,
+            self.tr("product_switched_title"),
+            self.tr(
+                "product_switched_message",
+                product=self.get_product_display_name(self.current_product_name),
+            ),
+        )
+
+    def on_product_name_clicked_from_table(self, product_name):
+        try:
+            # 查找产品测试数据
+            product_test = None
+            for test in self.product_tests:
+                test_display_name = test.get('display_name', '')
+                if test_display_name == product_name:
+                    product_test = test
+                    break
+            
+            if product_test:
+                product_name = product_test.get('product_name')
+                self.selected_product_from_table = product_name
+                self.is_viewing_product_from_table = True
+                
+                # 直接跳转到graphicsView_image界面（页面1）
+                self.stackedWidget.setCurrentIndex(1)
+                
+                # 显示该产品的综合图表
+                self.show_product_visualization(product_name, is_current_product=False)
+                
+                display_name = product_test.get('display_name', product_name)
+                self.set_status_message("status_viewing_analysis_result", product=display_name)
+            else:
+                self._show_message_box(
+                    QMessageBox.Warning,
+                    self.tr("data_not_found_title"),
+                    self.tr("product_details_not_found", product=product_name),
+                )
+        except Exception as e:
+            self.logger.error(f"Failed to open product details: {e}")
+            self._show_message_box(
+                QMessageBox.Critical,
+                self.tr("error_title"),
+                self.tr("failed_to_open_product_details", error=str(e)),
+            )
+
+    def end_test(self):
+        if self.is_recording:
+            self.camera_manager.stop_recording()
+        
+        reply = self._show_message_box(
+            QMessageBox.Question,
+            self.tr("finish_title"),
+            self.tr("finish_test_message"),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.camera_manager.release()
+            self.test_complete.emit()
+    
+    def reset_test(self):
+        self.is_recording = False
+        self.recording_completed = False
+        self.current_video_path = ""
+        
+        self.stackedWidget.setCurrentIndex(0)
+        self.workflow_stage = "test_ready"
+        self.set_window_title_text(
+            "test_window_title",
+            person_id=self.person_id,
+            product=self.get_product_display_name(self.current_product_name),
+        )
+        self.set_camera_title(
+            "test_preview_title",
+            product=self.get_product_display_name(self.current_product_name),
+        )
+        self.begin_pushButton.setText(
+            self.tr(
+                "start_recording_button",
+                product=self.get_product_display_name(self.current_product_name),
+            )
+        )
+        self.begin_pushButton.setEnabled(self.calibration_completed)
+        self.begin_pushButton.setStyleSheet(self.get_default_button_style())
+        self.progressBar_recording.setValue(0)
+        self.set_remaining_time(8)
+        self.set_status_message(
+            "status_ready_product",
+            product=self.get_product_display_name(self.current_product_name),
+        )
+        self._sync_calibration_button_state()
+        self.update_button_states(initial=True)
+    
+    def get_recording_button_style(self):
+        return """
+        QPushButton {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                        stop:0 #e74c3c, stop:1 #c0392b);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            padding: 20px 25px;
+            font-size: 50px;
+        }
+        QPushButton:disabled {
+            background: #95a5a6;
+            color: #7f8c8d;
+        }
+        """
+    
+    def get_default_button_style(self):
+        return """
+        QPushButton {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                        stop:0 #667eea, stop:1 #764ba2);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            padding: 20px 25px;
+            font-size: 50px;
+        }
+        """
+    
+    def get_disabled_button_style(self):
+        return """
+        QPushButton {
+            background: #bdc3c7;
+            color: #7f8c8d;
+            border: none;
+            border-radius: 10px;
+            padding: 20px 25px;
+            font-size: 50px;
+        }
+        QPushButton:hover {
+            background: #bdc3c7;
+            color: #7f8c8d;
+        }
+        """
+     
+    # 合并结果
+    def generate_emotion_radar(self, product_name, product_csv_path):
+        try:            
+            analyzer = SimplifiedEmotionAnalysis(
+                user_id=self.person_id,
+                product_name=product_name
+            )
+            score, speech, six_dim_scores, radar_chart_path = analyzer.run_full_analysis(
+                calibration_csv_path=self.calibration_csv_path,
+                product_csv_path=product_csv_path
+            ) 
+            print(f"generate_emotion_radar:{speech} --- {six_dim_scores}")
+            return score, speech, six_dim_scores, radar_chart_path
+        except Exception:
+            return None
+
+    def generate_emotion_curve(self, product_name, product_csv_path):
+        try:
+            if not os.path.exists(product_csv_path):
+                return None
+                
+            visualizer = EmotionLineChat(
+                calib_csv_file=self.calibration_csv_path,   
+                pro_csv_file=product_csv_path,   
+                person_id=self.person_id,
+                product_name=product_name,
+                video_duration=8,           
+                frame_interval=1 
+            )
+            
+            output_path = visualizer.create_emotion_curve()
+            print(f"Generated a new emotion curve chart: {output_path}")
+            return output_path if os.path.exists(output_path) else None
+                
+        except Exception as e:
+            print(f"Failed to generate the emotion curve chart: {e}")
+            return None  
+
+    def generate_comprehensive_chart(self, product_name, product_csv_path):
+        """Generate the summary analysis chart."""
+        try:
+            curve_path = self.generate_emotion_curve(product_name, product_csv_path)
+            radar_result = self.generate_emotion_radar(product_name, product_csv_path)
+            if not radar_result:
+                return None
+
+            score, top_emotions, six_dim_scores, radar_path = radar_result
+
+            if curve_path and os.path.exists(curve_path) and radar_path and os.path.exists(radar_path):
+                comprehensive_path = self.merge_charts(
+                    curve_path, radar_path, score, top_emotions, six_dim_scores, product_name
+                )
+                print(f'generate_comprehensive_chart{top_emotions}')
+                return score, top_emotions, comprehensive_path
+        except Exception as e:
+            self.logger.error(f"Failed to generate the summary chart: {e}")
+            return None
+
+    def merge_charts(self, curve_path, radar_path, comprehensive_score, top_emotions, six_dim_scores, product_name):
+
+        def get_emotion_level(score):
+            if score <= 40:
+                return self.tr("level_minimal")
+            elif score <= 60:
+                return self.tr("level_mild")
+            elif score <= 80:
+                return self.tr("level_moderate")
+            else:
+                return self.tr("level_strong")
+
+        def measure_text_width(text, font):
+            if hasattr(draw, "textbbox"):
+                left, _, right, _ = draw.textbbox((0, 0), text, font=font)
+                return right - left
+            width, _ = draw.textsize(text, font=font)
+            return width
+
+        curve_img = Image.open(curve_path)
+        radar_img = Image.open(radar_path)
+
+        total_width = 3600
+        total_height = 3000
+        new_img = Image.new('RGB', (total_width, total_height), (255, 255, 255))
+        draw = ImageDraw.Draw(new_img)
+
+        # 字体 
+        font_title = ImageFont.truetype('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', 58)
+        font_info = ImageFont.truetype('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', 44)
+        font_desc = ImageFont.truetype('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', 38)
+
+        # 区域划分
+        header_height = 140
+        middle_height = int((total_height - header_height) * 0.40)
+        bottom_height = total_height - header_height - middle_height
+        
+        draw.rectangle([(0, 0), (total_width, header_height)], fill=(240, 240, 240))
+        product_display = self.get_product_display_name(product_name)
+        score_text = self.tr("chart_emotional_index", product=product_display, score=int(comprehensive_score))
+        draw.text((60, 38), score_text, fill=(0, 0, 0), font=font_title)
+
+        curve_width = int(total_width * 0.95)
+        curve_resized = curve_img.resize((curve_width, middle_height), Image.LANCZOS) 
+        new_img.paste(curve_resized, (0, header_height))
+
+        bottom_y = header_height + middle_height
+        draw.rectangle([(0, bottom_y), (total_width, total_height)], fill=(255, 255, 255))
+        
+        title_x = 48
+        title_y = bottom_y + 24
+        draw.text((title_x, title_y), self.tr("chart_emotion_distribution"), fill=(0, 0, 0), font=font_info)
+
+        desc_x = title_x + 520
+        desc_y = title_y - 2
+
+        text = self.language_manager.translate_emotion_text(str(top_emotions)) if top_emotions else ""
+        max_text_width = total_width // 2 - desc_x - 120
+        lines = []
+        if text:
+            words = text.split()
+            current_line = ""
+            for word in words:
+                candidate = word if not current_line else f"{current_line} {word}"
+                if measure_text_width(candidate, font_desc) <= max_text_width:
+                    current_line = candidate
+                else:
+                    if current_line:
+                        lines.append(current_line)
+                    current_line = word
+            if current_line:
+                lines.append(current_line)
+        else:
+            lines.append(self.tr("chart_no_dominant_summary"))
+
+        line_height = 48
+        for i, line in enumerate(lines):
+            draw.text((desc_x, desc_y + i * line_height), line, fill=(0, 0, 0), font=font_desc)
+
+        text_block_height = len(lines) * line_height
+        radar_height = int(bottom_height * 0.9)
+        radar_y = bottom_y + max(140, text_block_height + 100)
+        radar_width = total_width // 2 - 90 
+        radar_resized = radar_img.resize((radar_width, radar_height), Image.LANCZOS)
+        new_img.paste(radar_resized, (60, radar_y))
+
+        table_y = radar_y + 130
+        table_x = total_width // 2 + 210 
+        table_width = 980
+        
+        emotion_col_width = 250
+        score_col_width = 170
+        col_spacing = 36
+        
+        header_row_height = 82
+        draw.rectangle([(table_x, table_y), (table_x + table_width, table_y + header_row_height)], fill=(240, 240, 240))
+        emotion_header_x = table_x + 20
+        score_header_x = emotion_header_x + emotion_col_width + col_spacing + 15
+        level_header_x = score_header_x + score_col_width + col_spacing + 15
+        
+        draw.text((emotion_header_x, table_y + 20), self.tr("chart_emotion_label"), fill=(0, 0, 0), font=font_info)
+        draw.text((score_header_x, table_y + 20), self.tr("chart_score_label"), fill=(0, 0, 0), font=font_info)
+        draw.text((level_header_x, table_y + 20), self.tr("chart_level_label"), fill=(0, 0, 0), font=font_info)
+        draw.line([(table_x, table_y + header_row_height), (table_x + table_width, table_y + header_row_height)], fill=(0, 0, 0), width=2)
+
+        # 对情绪按得分排序
+        row_height = 108
+        sorted_emotions = sorted(six_dim_scores.items(), key=lambda x: x[1], reverse=True)  
+        
+        for i, (emotion, score) in enumerate(sorted_emotions):
+            row_top = table_y + header_row_height + i * row_height
+            row_bottom = row_top + row_height
+            
+            level = get_emotion_level(score)
+            display_score = '< 40' if score <= 40 else f"{int(score)}"
+
+            draw.text(
+                (emotion_header_x, row_top + 26),
+                self.language_manager.get_emotion_dimension_label(str(emotion)),
+                fill=(0, 0, 0),
+                font=font_desc,
+            )
+            draw.text((score_header_x, row_top + 26), display_score, fill=(0, 0, 0), font=font_desc)
+            draw.text((level_header_x, row_top + 26), level, fill=(0, 0, 0), font=font_desc)
+
+        # 绘制表格边框
+        table_height = header_row_height + len(sorted_emotions) * row_height
+        
+        # 绘制列分隔线
+        
+        output_dir = os.path.dirname(curve_path)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        output_path = os.path.join(output_dir, f"{product_name}_comprehensive.png")   
+        new_img.save(str(output_path))
+        return str(output_path)
+  
+  
+
+    def setup_comprehensive_analysis_page(self):
+        if not hasattr(self, 'score_table'):
+            self.score_table = ComprehensiveScoreTable()
+            self.score_table.product_name_clicked.connect(self.on_product_name_clicked_from_table)
+            
+            comprehensive_page = self.stackedWidget.widget(2)
+            if comprehensive_page:
+                comprehensive_page.setStyleSheet("""
+                    QWidget {
+                        background-color: white;
+                        border: none;
+                    }
+                """)
+                layout = comprehensive_page.layout()
+                if layout is None:
+                    layout = QVBoxLayout(comprehensive_page)
+
+                for i in reversed(range(layout.count())):
+                    item = layout.itemAt(i)
+                    widget = item.widget()
+                    if widget:
+                        widget.setParent(None)
+                
+                layout.addWidget(self.score_table)
+
+    def show_comprehensive_analysis(self):
+        """Show the overall analysis results."""
+        if not self.recording_completed and not self.comprehensive_analysis_shown:
+            reply = self._show_message_box(
+                QMessageBox.Question,
+                self.tr("confirm_action_title"),
+                self.tr("overall_analysis_requires_completion"),
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            
+            if reply == QMessageBox.No:
+                return
+        
+        self.comprehensive_analysis_shown = True
+        
+        if not hasattr(self, 'score_table'):
+            self.setup_comprehensive_analysis_page()
+
+        self.refresh_score_table()
+        self.stackedWidget.setCurrentIndex(2)
+        
+        self.begin_pushButton.setEnabled(False)
+        self.next_pushButton_3.setEnabled(False)
+        
+        self.update_button_styles()
+        self.set_status_message("status_overall_analysis_mode")
+
+    def refresh_score_table(self):
+        if hasattr(self, 'score_table') and self.product_tests:
+            try:
+                table_data = {
+                    'user_id': self.person_id,
+                    'products': {}
+                }
+                for test in self.product_tests:
+                    product_name = test['product_name']
+                    score_data = test.get('score_data', 0)
+                    print(f"Refreshing score table with: {test}")
+                    emotion_details = test.get('emotion_details', 'Pending')
+                    table_data['products'][product_name] = {
+                        'product_name': test.get('display_name', product_name),
+                        'comprehensive_score': score_data,
+                        'primary_emotion_reaction': emotion_details
+                    }
+                
+                self.score_table.update_product_data(table_data)
+                
+                if hasattr(self.score_table, 'product_name_clicked'):
+                    try:
+                        self.score_table.product_name_clicked.disconnect()
+                    except Exception:
+                        pass
+                    self.score_table.product_name_clicked.connect(self.on_product_name_clicked_from_table)
+                
+            except Exception as e:
+                print(f"Failed to refresh the score table: {e}")
+
+    def set_calibration_data(self, calibration_csv_path):
+        try:
+            self.calibration_csv_path = calibration_csv_path
+            if os.path.exists(calibration_csv_path):
+                self.calibration_completed = True
+                self.calibration_data = pd.read_csv(calibration_csv_path)
+                self.set_status_message(
+                    "status_calibration_data_loaded",
+                    file_name=os.path.basename(calibration_csv_path),
+                )
+            else:
+                self.set_status_message("status_calibration_data_missing")
+        except Exception as e:
+            self.set_status_message("status_calibration_data_error", error=e)
+
+    def find_product_test(self, product_name):
+        for test in self.product_tests:
+            if test.get('product_name') == product_name:
+                return test
+        return None 
+
+    def show_product_visualization(self, product_name, is_current_product=True):
+        try:
+            product_test = self.find_product_test(product_name)
+            print(f"show_product_visualization payload: {product_test}")
+            if not product_test:
+                return
+            
+            self.stackedWidget.setCurrentIndex(1)
+            
+            comprehensive_path = product_test.get('comprehensive_path')
+            if not comprehensive_path or not os.path.exists(comprehensive_path):
+                result = self.generate_comprehensive_chart(product_name, product_test['csv_path'])
+                if result:
+                    score_data, top_emotions, comprehensive_path = result
+                    if comprehensive_path:
+                        product_test['comprehensive_path'] = comprehensive_path
+                        product_test['score_data'] = score_data
+                        product_test['emotion_details'] = top_emotions
+            
+            if comprehensive_path and os.path.exists(comprehensive_path):
+                self.display_comprehensive_chart(comprehensive_path)
+        except Exception as e:
+            self.logger.error(f"Failed to display the product visualization: {e}")
+
+    def refresh_display_after_analysis(self, product_name):
+        current_page = self.stackedWidget.currentIndex()
+        if current_page == 2:
+            self.refresh_score_table()
+        elif current_page == 1:
+            self.show_product_visualization(product_name)  
+
+    def display_comprehensive_chart(self, image_path):
+        """Display the summary chart in graphicsView_image."""
+        try:
+            if not hasattr(self, 'graphicsView_image'):
+                return
+
+            scene = self.graphicsView_image.scene()
+            if scene:
+                scene.clear()
+            
+            pixmap = QPixmap(image_path)
+            if pixmap.isNull():
+                self.graphicsView_image.setScene(None)
+                return
+            
+            scene = QGraphicsScene()
+            pixmap_item = QGraphicsPixmapItem(pixmap)
+            scene.addItem(pixmap_item)
+            
+            self.graphicsView_image.setScene(scene)
+            self.graphicsView_image.setRenderHints(
+                QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing
+            )
+            self.graphicsView_image.fitInView(pixmap_item, Qt.KeepAspectRatio)
+            self.graphicsView_image.show()
+            
+        except Exception as e:
+            self.logger.error(f"{e}")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.sync_primary_button_geometry()
+        self.position_top_right_buttons()
+
+    def keyPressEvent(self, event):
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        self._disconnect_runtime_signals()
+        self.camera_manager.release()
+        event.accept()
